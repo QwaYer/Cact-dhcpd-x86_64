@@ -9,10 +9,13 @@
  * Usage:
  *   dhcpd [-i IFACE] [-f]
  *   dhcpd -6 [-i IFACE]        (SLAAC: IPv6 stateless autoconfiguration)
+ *   dhcpd -6 -D [-i IFACE]     (stateful DHCPv6 + default route from RA)
  *
  *   -i IFACE   interface name to configure (default: the primary NIC)
  *   -6         IPv6 SLAAC instead of DHCPv4: send a Router Solicitation over a
  *              raw ICMPv6 socket and apply the advertised prefix (EUI-64 IID)
+ *   -D         stateful DHCPv6 (implies -6): SOLICIT/REQUEST to ff02::1:2 for an
+ *              address + DNS; the default route still comes from an RA
  *   -f         do not go into the background (foreground is the default anyway)
  *
  * The daemon is meant to be run as root (CACT_NETCTL_IFACE_SETCFG is required).
@@ -472,13 +475,15 @@ static void mask_prefix(uint8_t addr[16], int prefix_len) {
     }
 }
 
-static int net_apply6(const uint8_t addr[16], uint32_t prefix, const uint8_t gw[16]) {
+static int net_apply6(const uint8_t addr[16], uint32_t prefix,
+                      const uint8_t gw[16], const uint8_t dns[16]) {
     cact_iface_setcfg6_arg_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.index  = (uint32_t)g_ifindex;
     cfg.prefix = prefix;
     memcpy(cfg.addr, addr, 16);
     if (gw) memcpy(cfg.gateway, gw, 16);
+    if (dns) memcpy(cfg.dns, dns, 16);
     int fd = open("/dev/net", O_RDWR);
     if (fd < 0) return -1;
     int r = ioctl(fd, CACT_NETCTL_IFACE_SETCFG6, &cfg);
@@ -579,7 +584,7 @@ static int slaac_run(int want_name) {
                         ip6_print(src.sin6_addr.s6_addr);
                         printf("\n");
                         if (router_lifetime != 0) {
-                            if (net_apply6(addr, plen, src.sin6_addr.s6_addr) != 0)
+                            if (net_apply6(addr, plen, src.sin6_addr.s6_addr, 0) != 0)
                                 printf("dhcpd: SLAAC: IFACE_SETCFG6 failed (root needed?)\n");
                             else
                                 printf("dhcpd: SLAAC address applied\n");
@@ -596,10 +601,235 @@ static int slaac_run(int want_name) {
     }
 }
 
+/* ── DHCPv6 (RFC 8415) — `dhcpd -6 -D` ────────────────────────────────────
+ * Stateful DHCPv6: SOLICIT → ADVERTISE → REQUEST → REPLY over UDPv6 to
+ * ff02::1:2:547.  We take the address from IA_NA (an IAADDR is /128) and the
+ * resolver from the DNS-servers option; the default route is not carried by
+ * DHCPv6, so a short Router Advertisement listen supplies it. */
+
+#define DH6_CLIENT_PORT 546
+#define DH6_SERVER_PORT 547
+#define DH6_SOLICIT     1
+#define DH6_ADVERTISE   2
+#define DH6_REQUEST     3
+#define DH6_REPLY       7
+
+#define DH6_OPT_CLIENTID    1
+#define DH6_OPT_SERVERID    2
+#define DH6_OPT_IA_NA       3
+#define DH6_OPT_IAADDR      5
+#define DH6_OPT_ORO         6
+#define DH6_OPT_ELAPSED     8
+#define DH6_OPT_DNS_SERVERS 23
+
+static uint32_t g_dh6_iaid = 0x0cac0001u;
+
+/* Find option `code` in a DHCPv6 message body starting at `off`; returns its
+ * value pointer, writing the value length to `*olen`, or NULL. */
+static const uint8_t *dh6_find(const uint8_t *msg, int len, int off,
+                               uint16_t code, int *olen) {
+    while (off + 4 <= len) {
+        uint16_t c = (uint16_t)((msg[off] << 8) | msg[off + 1]);
+        uint16_t l = (uint16_t)((msg[off + 2] << 8) | msg[off + 3]);
+        off += 4;
+        if (off + l > len) return 0;
+        if (c == code) { if (olen) *olen = l; return msg + off; }
+        off += l;
+    }
+    return 0;
+}
+
+static int dh6_put(uint8_t *buf, int off, int cap,
+                   uint16_t code, const uint8_t *val, int vlen) {
+    if (off + 4 + vlen > cap) return off;
+    buf[off++] = (uint8_t)(code >> 8);
+    buf[off++] = (uint8_t)code;
+    buf[off++] = (uint8_t)(vlen >> 8);
+    buf[off++] = (uint8_t)vlen;
+    if (vlen) { memcpy(buf + off, val, vlen); off += vlen; }
+    return off;
+}
+
+static int dh6_send(int fd, const struct sockaddr_in6 *srv, uint8_t code,
+                    const uint8_t mac[6], const uint8_t *server_id, int server_id_len) {
+    uint8_t m[256];
+    int o = 0;
+    m[o++] = code;
+    m[o++] = (uint8_t)(g_xid >> 16);
+    m[o++] = (uint8_t)(g_xid >> 8);
+    m[o++] = (uint8_t)g_xid;
+    /* Client ID: DUID-LL (type 3, hwtype 1 Ethernet, MAC). */
+    uint8_t duid[10];
+    duid[0] = 0; duid[1] = 3; duid[2] = 0; duid[3] = 1;
+    memcpy(duid + 4, mac, 6);
+    o = dh6_put(m, o, (int)sizeof(m), DH6_OPT_CLIENTID, duid, 10);
+    if (server_id && server_id_len > 0)
+        o = dh6_put(m, o, (int)sizeof(m), DH6_OPT_SERVERID, server_id, server_id_len);
+    /* IA_NA: IAID + T1(0) + T2(0), no IAADDR in a SOLICIT. */
+    uint8_t ia[12];
+    ia[0] = (uint8_t)(g_dh6_iaid >> 24); ia[1] = (uint8_t)(g_dh6_iaid >> 16);
+    ia[2] = (uint8_t)(g_dh6_iaid >> 8);  ia[3] = (uint8_t)g_dh6_iaid;
+    ia[4] = ia[5] = ia[6] = ia[7] = 0;
+    ia[8] = ia[9] = ia[10] = ia[11] = 0;
+    o = dh6_put(m, o, (int)sizeof(m), DH6_OPT_IA_NA, ia, 12);
+    /* ORO: DNS servers; Elapsed Time 0. */
+    uint8_t oro[2]; oro[0] = 0; oro[1] = DH6_OPT_DNS_SERVERS;
+    o = dh6_put(m, o, (int)sizeof(m), DH6_OPT_ORO, oro, 2);
+    uint8_t el[2]; el[0] = 0; el[1] = 0;
+    o = dh6_put(m, o, (int)sizeof(m), DH6_OPT_ELAPSED, el, 2);
+    return sendto(fd, m, o, 0, (const struct sockaddr *)srv, sizeof(*srv)) < 0 ? -1 : 0;
+}
+
+/* Poll for a message of `want_type`; copies it into `buf`, returns its length. */
+static int dh6_recv(int fd, uint8_t *buf, int cap, uint8_t want_type, int timeout_ms) {
+    for (int waited = 0; waited < timeout_ms; waited += 200) {
+        struct pollfd pfd; pfd.fd = fd; pfd.events = POLLIN; pfd.revents = 0;
+        if (poll(&pfd, 1, 200) <= 0) continue;
+        int r = (int)recv(fd, buf, (uint32_t)cap, 0);
+        if (r >= 4 && buf[0] == want_type) return r;
+    }
+    return -1;
+}
+
+/* Short Router Solicitation/Advertisement exchange for the default router's
+ * link-local address (DHCPv6 carries no default route). */
+static int ra_router_listen(int rawfd, const uint8_t mac[6], uint8_t out_router[16]) {
+    struct sockaddr_in6 dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin6_family = AF_INET6;
+    (void)inet_pton(AF_INET6, "ff02::2", dst.sin6_addr.s6_addr);
+    uint8_t rs[16];
+    int n = 0;
+    rs[n++] = ICMPV6_RS; rs[n++] = 0;
+    rs[n++] = 0; rs[n++] = 0; rs[n++] = 0; rs[n++] = 0; rs[n++] = 0; rs[n++] = 0;
+    rs[n++] = ND_OPT_SRC_LLADDR; rs[n++] = 1;
+    memcpy(rs + n, mac, 6); n += 6;
+    (void)sendto(rawfd, rs, n, 0, (struct sockaddr *)&dst, sizeof(dst));
+    for (int i = 0; i < 6; i++) {
+        struct pollfd pfd; pfd.fd = rawfd; pfd.events = POLLIN; pfd.revents = 0;
+        if (poll(&pfd, 1, 500) <= 0) continue;
+        uint8_t buf[256];
+        struct sockaddr_in6 src;
+        uint32_t sl = sizeof(src);
+        int r = recvfrom(rawfd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &sl);
+        if (r >= 16 && buf[0] == ICMPV6_RA) {
+            if (out_router) memcpy(out_router, src.sin6_addr.s6_addr, 16);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int dhcpv6_run(int want_name) {
+    cact_iface_info_t link;
+    for (;;) {
+        int idx = want_name ? iface_index_by_name(g_iface) : 0;
+        if (idx >= 0) {
+            g_ifindex = idx;
+            if (net_get(&link) == 0 && link.link_up && link.mac[0] != 0) {
+                int ll = 0;
+                for (int k = 0; k < 16; k++)
+                    if (link.ip6_link_local[k]) ll = 1;
+                if (ll) break;
+            }
+        }
+        sleep(1);
+    }
+    printf("dhcpd: DHCPv6 on %s\n", link.name);
+    g_xid = (uint32_t)time(0) ^ ((uint32_t)getpid() << 8);
+
+    int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) { printf("dhcpd: cannot open DHCPv6 UDP socket\n"); return 1; }
+    struct sockaddr_in6 local;
+    memset(&local, 0, sizeof(local));
+    local.sin6_family = AF_INET6;
+    local.sin6_port   = htons(DH6_CLIENT_PORT);
+    memcpy(local.sin6_addr.s6_addr, link.ip6_link_local, 16);  /* pin to this NIC */
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0)
+        printf("dhcpd: DHCPv6 bind :546 failed\n");
+
+    struct sockaddr_in6 srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.sin6_family = AF_INET6;
+    srv.sin6_port   = htons(DH6_SERVER_PORT);
+    (void)inet_pton(AF_INET6, "ff02::1:2", srv.sin6_addr.s6_addr);
+
+    for (;;) {
+        printf("dhcpd: DHCPv6: sending SOLICIT\n");
+        if (dh6_send(fd, &srv, DH6_SOLICIT, link.mac, 0, 0) < 0) { sleep(2); continue; }
+        uint8_t buf[512];
+        int r = dh6_recv(fd, buf, sizeof(buf), DH6_ADVERTISE, 3000);
+        if (r < 0) { printf("dhcpd: DHCPv6: no ADVERTISE, retrying\n"); sleep(2); continue; }
+        int sid_len = 0;
+        const uint8_t *sid = dh6_find(buf, r, 4, DH6_OPT_SERVERID, &sid_len);
+        uint8_t server_id[130];
+        int have_sid = 0;
+        if (sid && sid_len > 0 && sid_len <= (int)sizeof(server_id)) {
+            memcpy(server_id, sid, sid_len);
+            have_sid = 1;
+        }
+        printf("dhcpd: DHCPv6: ADVERTISE, sending REQUEST\n");
+        if (dh6_send(fd, &srv, DH6_REQUEST, link.mac, have_sid ? server_id : 0, sid_len) < 0) {
+            sleep(2);
+            continue;
+        }
+        r = dh6_recv(fd, buf, sizeof(buf), DH6_REPLY, 3000);
+        if (r < 0) { printf("dhcpd: DHCPv6: no REPLY, retrying\n"); sleep(2); continue; }
+
+        /* IA_NA → IAADDR → address. */
+        uint8_t addr[16];
+        int have_addr = 0;
+        int ia_len = 0;
+        const uint8_t *ia = dh6_find(buf, r, 4, DH6_OPT_IA_NA, &ia_len);
+        if (ia && ia_len >= 12) {
+            int alen = 0;
+            const uint8_t *iaaddr = dh6_find(ia, ia_len, 12, DH6_OPT_IAADDR, &alen);
+            if (iaaddr && alen >= 16) { memcpy(addr, iaaddr, 16); have_addr = 1; }
+        }
+        uint8_t dns[16];
+        int have_dns = 0;
+        int dlen = 0;
+        const uint8_t *d = dh6_find(buf, r, 4, DH6_OPT_DNS_SERVERS, &dlen);
+        if (d && dlen >= 16) { memcpy(dns, d, 16); have_dns = 1; }
+
+        if (!have_addr) {
+            printf("dhcpd: DHCPv6 REPLY without an address\n");
+            close(fd);
+            return 1;
+        }
+        printf("dhcpd: DHCPv6 addr "); ip6_print(addr);
+        if (have_dns) { printf(" dns "); ip6_print(dns); }
+        printf("\n");
+
+        uint8_t router[16];
+        memset(router, 0, sizeof(router));
+        int rawfd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+        if (rawfd >= 0) {
+            struct sockaddr_in6 la;
+            memset(&la, 0, sizeof(la));
+            la.sin6_family = AF_INET6;
+            memcpy(la.sin6_addr.s6_addr, link.ip6_link_local, 16);
+            (void)bind(rawfd, (struct sockaddr *)&la, sizeof(la));
+            if (ra_router_listen(rawfd, link.mac, router) == 0) {
+                printf("dhcpd: DHCPv6 router from RA "); ip6_print(router); printf("\n");
+            }
+            close(rawfd);
+        }
+
+        if (net_apply6(addr, 128, router[0] ? router : 0, have_dns ? dns : 0) != 0)
+            printf("dhcpd: DHCPv6: IFACE_SETCFG6 failed (root needed?)\n");
+        else
+            printf("dhcpd: DHCPv6 address applied\n");
+        close(fd);
+        return 0;
+    }
+}
+
 int main(int argc, char *argv[]) {
     int foreground = 1;
     int want_name = 0;
     int slaac = 0;
+    int dhcpv6 = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') continue;
         if (argv[i][1] == 'i' && i + 1 < argc) {
@@ -607,6 +837,8 @@ int main(int argc, char *argv[]) {
             want_name = 1;
         } else if (argv[i][1] == '6') {
             slaac = 1;
+        } else if (argv[i][1] == 'D') {
+            dhcpv6 = 1;   /* stateful DHCPv6 (implies -6) */
         } else if (argv[i][1] == 'f') {
             foreground = 1;
         } else if (argv[i][1] == 'd') {
@@ -616,7 +848,9 @@ int main(int argc, char *argv[]) {
     (void)foreground;
 
     if (slaac)
-        return slaac_run(want_name);
+        return dhcpv6 ? dhcpv6_run(want_name) : slaac_run(want_name);
+    if (dhcpv6)
+        return dhcpv6_run(want_name);
     for (;;) {
         /* wait for the target card to appear (and resolve -i IFACE to an index) */
         cact_iface_info_t link;
