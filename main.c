@@ -8,8 +8,11 @@
  *
  * Usage:
  *   dhcpd [-i IFACE] [-f]
+ *   dhcpd -6 [-i IFACE]        (SLAAC: IPv6 stateless autoconfiguration)
  *
  *   -i IFACE   interface name to configure (default: the primary NIC)
+ *   -6         IPv6 SLAAC instead of DHCPv4: send a Router Solicitation over a
+ *              raw ICMPv6 socket and apply the advertised prefix (EUI-64 IID)
  *   -f         do not go into the background (foreground is the default anyway)
  *
  * The daemon is meant to be run as root (CACT_NETCTL_IFACE_SETCFG is required).
@@ -25,6 +28,7 @@
 #include <socket.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <ioctl_abi.h>
 
 #define DHCP_MAGIC      0x63825363u
@@ -429,14 +433,180 @@ static void lease_print(const lease_t *ls) {
            (unsigned)ls->lease_s, (unsigned)ls->t1_s, (unsigned)ls->t2_s);
 }
 
+/* ── SLAAC (IPv6 stateless autoconfiguration, `dhcpd -6`) ─────────────────
+ * The kernel exposes a raw ICMPv6 socket (SOCK_RAW/AF_INET6/IPPROTO_ICMPV6);
+ * we send a Router Solicitation and apply the address a Router Advertisement
+ * advertises.  DHCPv6 (stateful) is not implemented. */
+
+#define ICMPV6_RS 133
+#define ICMPV6_RA 134
+#define ND_OPT_SRC_LLADDR 1
+#define ND_OPT_PREFIX_INFO 3
+#define ND_PREFIX_FLAG_A 0x40
+
+static void ip6_print(const uint8_t a[16]) {
+    char b[46];
+    if (inet_ntop(AF_INET6, a, b, sizeof(b)))
+        printf("%s", b);
+}
+
+/* EUI-64 interface identifier from a 48-bit MAC (RFC 4291 App. A). */
+static void iid_from_mac(const uint8_t mac[6], uint8_t iid[8]) {
+    iid[0] = (uint8_t)(mac[0] ^ 0x02);
+    iid[1] = mac[1];
+    iid[2] = mac[2];
+    iid[3] = 0xff;
+    iid[4] = 0xfe;
+    iid[5] = mac[3];
+    iid[6] = mac[4];
+    iid[7] = mac[5];
+}
+
+/* Zero every bit of `addr` below `prefix_len`. */
+static void mask_prefix(uint8_t addr[16], int prefix_len) {
+    for (int i = 0; i < 16; i++) {
+        int bits = prefix_len - i * 8;
+        if (bits >= 8) continue;
+        if (bits <= 0) { addr[i] = 0; continue; }
+        addr[i] &= (uint8_t)(0xFF << (8 - bits));
+    }
+}
+
+static int net_apply6(const uint8_t addr[16], uint32_t prefix, const uint8_t gw[16]) {
+    cact_iface_setcfg6_arg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.index  = (uint32_t)g_ifindex;
+    cfg.prefix = prefix;
+    memcpy(cfg.addr, addr, 16);
+    if (gw) memcpy(cfg.gateway, gw, 16);
+    int fd = open("/dev/net", O_RDWR);
+    if (fd < 0) return -1;
+    int r = ioctl(fd, CACT_NETCTL_IFACE_SETCFG6, &cfg);
+    close(fd);
+    return r;
+}
+
+static int slaac_run(int want_name) {
+    cact_iface_info_t link;
+    for (;;) {
+        int idx = want_name ? iface_index_by_name(g_iface) : 0;
+        if (idx >= 0) {
+            g_ifindex = idx;
+            if (net_get(&link) == 0 && link.link_up && link.mac[0] != 0) {
+                int ll_nonzero = 0;
+                for (int k = 0; k < 16; k++)
+                    if (link.ip6_link_local[k]) ll_nonzero = 1;
+                if (ll_nonzero) break;
+            }
+        }
+        sleep(1);
+    }
+    printf("dhcpd: SLAAC on %s, link-local ", link.name);
+    ip6_print(link.ip6_link_local);
+    printf("\n");
+
+    int fd = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    if (fd < 0) {
+        printf("dhcpd: cannot open raw ICMPv6 socket\n");
+        return 1;
+    }
+    /* Bind to the interface's link-local, so the raw socket is placed on that NIC. */
+    struct sockaddr_in6 la;
+    memset(&la, 0, sizeof(la));
+    la.sin6_family = AF_INET6;
+    memcpy(la.sin6_addr.s6_addr, link.ip6_link_local, 16);
+    (void)bind(fd, (struct sockaddr *)&la, sizeof(la));
+
+    struct sockaddr_in6 dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin6_family = AF_INET6;
+    (void)inet_pton(AF_INET6, "ff02::2", dst.sin6_addr.s6_addr);
+
+    for (;;) {
+        /* Router Solicitation: type, code, checksum(kernel), reserved(4),
+         * Source Link-Layer Address option. */
+        uint8_t rs[16];
+        int n = 0;
+        rs[n++] = ICMPV6_RS;
+        rs[n++] = 0;
+        rs[n++] = 0; rs[n++] = 0;   /* checksum — the kernel fills it */
+        rs[n++] = 0; rs[n++] = 0; rs[n++] = 0; rs[n++] = 0;
+        rs[n++] = ND_OPT_SRC_LLADDR;
+        rs[n++] = 1;                /* length in 8-octet units */
+        memcpy(rs + n, link.mac, 6);
+        n += 6;
+
+        printf("dhcpd: SLAAC: sending Router Solicitation\n");
+        (void)sendto(fd, rs, n, 0, (struct sockaddr *)&dst, sizeof(dst));
+
+        for (int tries = 0; tries < 8; tries++) {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, 500) <= 0)
+                continue;
+            uint8_t buf[256];
+            struct sockaddr_in6 src;
+            uint32_t sl = sizeof(src);
+            int r = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &sl);
+            if (r < 16 || buf[0] != ICMPV6_RA)
+                continue;
+
+            /* ICMPv6 RA header is 16 bytes; then options. */
+            uint16_t router_lifetime = (uint16_t)((buf[4] << 8) | buf[5]);
+            int oi = 16;
+            while (oi + 2 <= r) {
+                uint8_t t = buf[oi];
+                uint8_t l = buf[oi + 1];
+                int olen = (int)l * 8;
+                if (l == 0 || oi + olen > r)
+                    break;
+                if (t == ND_OPT_PREFIX_INFO && olen >= 32) {
+                    uint8_t plen  = buf[oi + 2];
+                    uint8_t flags = buf[oi + 3];
+                    const uint8_t *prefix = buf + oi + 16;
+                    if ((flags & ND_PREFIX_FLAG_A) && plen <= 64) {
+                        uint8_t addr[16];
+                        memcpy(addr, prefix, 16);
+                        mask_prefix(addr, plen);
+                        iid_from_mac(link.mac, addr + 8);
+                        printf("dhcpd: SLAAC prefix ");
+                        ip6_print(prefix);
+                        printf("/%u -> addr ", (unsigned)plen);
+                        ip6_print(addr);
+                        printf(", gw ");
+                        ip6_print(src.sin6_addr.s6_addr);
+                        printf("\n");
+                        if (router_lifetime != 0) {
+                            if (net_apply6(addr, plen, src.sin6_addr.s6_addr) != 0)
+                                printf("dhcpd: SLAAC: IFACE_SETCFG6 failed (root needed?)\n");
+                            else
+                                printf("dhcpd: SLAAC address applied\n");
+                        }
+                        close(fd);
+                        return 0;   /* the kernel holds the address; one cycle suffices */
+                    }
+                }
+                oi += olen;
+            }
+        }
+        printf("dhcpd: SLAAC: no Router Advertisement yet, retrying\n");
+        sleep(2);
+    }
+}
+
 int main(int argc, char *argv[]) {
     int foreground = 1;
     int want_name = 0;
+    int slaac = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') continue;
         if (argv[i][1] == 'i' && i + 1 < argc) {
             g_iface = argv[++i];
             want_name = 1;
+        } else if (argv[i][1] == '6') {
+            slaac = 1;
         } else if (argv[i][1] == 'f') {
             foreground = 1;
         } else if (argv[i][1] == 'd') {
@@ -445,6 +615,8 @@ int main(int argc, char *argv[]) {
     }
     (void)foreground;
 
+    if (slaac)
+        return slaac_run(want_name);
     for (;;) {
         /* wait for the target card to appear (and resolve -i IFACE to an index) */
         cact_iface_info_t link;
