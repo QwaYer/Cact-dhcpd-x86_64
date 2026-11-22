@@ -9,10 +9,11 @@
  * Usage:
  *   dhcpd [-i IFACE] [-f]
  *
- *   -i IFACE   interface name (default eth0; CactOS has a single card)
+ *   -i IFACE   interface name to configure (default: the primary NIC)
  *   -f         do not go into the background (foreground is the default anyway)
  *
- * The daemon is meant to be run as root (CACT_NETCTL_NETCFG is required).
+ * The daemon is meant to be run as root (CACT_NETCTL_IFACE_SETCFG is required).
+ * With several NICs, run one dhcpd per interface (each with its own `-i IFACE`).
  */
 
 #include <stdint.h>
@@ -78,6 +79,7 @@ typedef struct {
 } lease_t;
 
 static const char *g_iface = IFACE_DEFAULT;
+static int         g_ifindex = 0;   /* resolved from -i IFACE, else the primary (0) */
 static uint32_t    g_xid   = 0;
 
 /* ────────────────────────────────────────────────────────────────────────── */
@@ -151,18 +153,39 @@ static void opt_end(uint8_t *opts, int *off, int cap) {
 
 /* ── /dev/net: read/apply kernel config ─────────────────────────────────── */
 
-static int net_get(cact_netcfg_get_t *g) {
+/* Index (CACT_NETCTL_IFACE_GET) of the interface named `name`, or -1. */
+static int iface_index_by_name(const char *name) {
     int fd = open("/dev/net", O_RDWR);
     if (fd < 0) return -1;
-    memset(g, 0, sizeof(*g));
-    int r = ioctl(fd, CACT_NETCTL_NETCFG_GET, g);
+    int count = ioctl(fd, CACT_NETCTL_IFACE_COUNT, 0);
+    int found = -1;
+    for (int i = 0; i < count; i++) {
+        cact_iface_get_arg_t a;
+        memset(&a, 0, sizeof(a));
+        a.index = (uint32_t)i;
+        if (ioctl(fd, CACT_NETCTL_IFACE_GET, &a) < 0) continue;
+        if (strcmp(a.info.name, name) == 0) { found = i; break; }
+    }
     close(fd);
+    return found;
+}
+
+static int net_get(cact_iface_info_t *g) {
+    int fd = open("/dev/net", O_RDWR);
+    if (fd < 0) return -1;
+    cact_iface_get_arg_t a;
+    memset(&a, 0, sizeof(a));
+    a.index = (uint32_t)g_ifindex;
+    int r = ioctl(fd, CACT_NETCTL_IFACE_GET, &a);
+    close(fd);
+    if (r == 0 && g) *g = a.info;
     return r;
 }
 
 static int net_apply(const lease_t *ls) {
-    cact_netcfg_arg_t cfg;
+    cact_iface_setcfg_arg_t cfg;
     memset(&cfg, 0, sizeof(cfg));
+    cfg.index        = (uint32_t)g_ifindex;
     cfg.ip_host      = ls->ip_host;
     cfg.netmask_host = ls->netmask_host;
     cfg.gateway_host = ls->gateway_host;
@@ -170,7 +193,7 @@ static int net_apply(const lease_t *ls) {
 
     int fd = open("/dev/net", O_RDWR);
     if (fd < 0) return -1;
-    int r = ioctl(fd, CACT_NETCTL_NETCFG, &cfg);
+    int r = ioctl(fd, CACT_NETCTL_IFACE_SETCFG, &cfg);
     close(fd);
     return r;
 }
@@ -408,10 +431,12 @@ static void lease_print(const lease_t *ls) {
 
 int main(int argc, char *argv[]) {
     int foreground = 1;
+    int want_name = 0;
     for (int i = 1; i < argc; i++) {
         if (argv[i][0] != '-') continue;
         if (argv[i][1] == 'i' && i + 1 < argc) {
             g_iface = argv[++i];
+            want_name = 1;
         } else if (argv[i][1] == 'f') {
             foreground = 1;
         } else if (argv[i][1] == 'd') {
@@ -421,10 +446,13 @@ int main(int argc, char *argv[]) {
     (void)foreground;
 
     for (;;) {
-        /* wait for the card to appear */
-        cact_netcfg_get_t link;
+        /* wait for the target card to appear (and resolve -i IFACE to an index) */
+        cact_iface_info_t link;
         memset(&link, 0, sizeof(link));
         for (;;) {
+            int idx = want_name ? iface_index_by_name(g_iface) : 0;
+            if (idx < 0) { sleep(1); continue; }
+            g_ifindex = idx;
             if (net_get(&link) == 0 && link.link_up && link.mac[0] != 0)
                 break;
             sleep(1);
