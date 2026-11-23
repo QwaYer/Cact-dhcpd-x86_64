@@ -445,6 +445,7 @@ static void lease_print(const lease_t *ls) {
 #define ICMPV6_RA 134
 #define ND_OPT_SRC_LLADDR 1
 #define ND_OPT_PREFIX_INFO 3
+#define ND_OPT_RDNSS 25          /* RFC 8106: recursive DNS servers */
 #define ND_PREFIX_FLAG_A 0x40
 
 static void ip6_print(const uint8_t a[16]) {
@@ -558,8 +559,18 @@ static int slaac_run(int want_name) {
             if (r < 16 || buf[0] != ICMPV6_RA)
                 continue;
 
-            /* ICMPv6 RA header is 16 bytes; then options. */
+            /* ICMPv6 RA header is 16 bytes; then options.  Collect everything we
+             * need from *all* of them before applying: the RDNSS option (RFC
+             * 8106) carrying the IPv6 resolver usually comes *after* the Prefix
+             * Information option, and applying the address the moment the prefix
+             * is seen would leave the resolver unset. */
             uint16_t router_lifetime = (uint16_t)((buf[4] << 8) | buf[5]);
+            uint8_t prefix_raw[16];
+            uint8_t addr[16];
+            uint32_t plen = 0;
+            int have_addr = 0;
+            uint8_t ra_dns[16];
+            int have_dns = 0;
             int oi = 16;
             while (oi + 2 <= r) {
                 uint8_t t = buf[oi];
@@ -568,32 +579,52 @@ static int slaac_run(int want_name) {
                 if (l == 0 || oi + olen > r)
                     break;
                 if (t == ND_OPT_PREFIX_INFO && olen >= 32) {
-                    uint8_t plen  = buf[oi + 2];
+                    uint8_t plen8 = buf[oi + 2];
                     uint8_t flags = buf[oi + 3];
                     const uint8_t *prefix = buf + oi + 16;
-                    if ((flags & ND_PREFIX_FLAG_A) && plen <= 64) {
-                        uint8_t addr[16];
+                    if (!have_addr && (flags & ND_PREFIX_FLAG_A) && plen8 <= 64) {
+                        memcpy(prefix_raw, prefix, 16);
                         memcpy(addr, prefix, 16);
-                        mask_prefix(addr, plen);
+                        mask_prefix(addr, plen8);
                         iid_from_mac(link.mac, addr + 8);
-                        printf("dhcpd: SLAAC prefix ");
-                        ip6_print(prefix);
-                        printf("/%u -> addr ", (unsigned)plen);
-                        ip6_print(addr);
-                        printf(", gw ");
-                        ip6_print(src.sin6_addr.s6_addr);
-                        printf("\n");
-                        if (router_lifetime != 0) {
-                            if (net_apply6(addr, plen, src.sin6_addr.s6_addr, 0) != 0)
-                                printf("dhcpd: SLAAC: IFACE_SETCFG6 failed (root needed?)\n");
-                            else
-                                printf("dhcpd: SLAAC address applied\n");
-                        }
-                        close(fd);
-                        return 0;   /* the kernel holds the address; one cycle suffices */
+                        plen = plen8;
+                        have_addr = 1;
+                    }
+                } else if (t == ND_OPT_RDNSS && olen >= 24 && !have_dns) {
+                    /* reserved(2) lifetime(4) then 16-byte server addresses; a
+                     * zero lifetime means the server must no longer be used. */
+                    uint32_t life = ((uint32_t)buf[oi + 4] << 24) |
+                                    ((uint32_t)buf[oi + 5] << 16) |
+                                    ((uint32_t)buf[oi + 6] << 8) |
+                                    (uint32_t)buf[oi + 7];
+                    if (life != 0) {
+                        memcpy(ra_dns, buf + oi + 8, 16);
+                        have_dns = 1;
                     }
                 }
                 oi += olen;
+            }
+            if (have_addr) {
+                printf("dhcpd: SLAAC prefix ");
+                ip6_print(prefix_raw);
+                printf("/%u -> addr ", (unsigned)plen);
+                ip6_print(addr);
+                printf(", gw ");
+                ip6_print(src.sin6_addr.s6_addr);
+                if (have_dns) {
+                    printf(", dns ");
+                    ip6_print(ra_dns);
+                }
+                printf("\n");
+                if (router_lifetime != 0) {
+                    if (net_apply6(addr, plen, src.sin6_addr.s6_addr,
+                                   have_dns ? ra_dns : 0) != 0)
+                        printf("dhcpd: SLAAC: IFACE_SETCFG6 failed (root needed?)\n");
+                    else
+                        printf("dhcpd: SLAAC address applied\n");
+                }
+                close(fd);
+                return 0;   /* the kernel holds the address; one cycle suffices */
             }
         }
         printf("dhcpd: SLAAC: no Router Advertisement yet, retrying\n");
